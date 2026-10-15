@@ -792,9 +792,10 @@ HRESULT DxGrabber::deepScaledCopy(DisplayHandle& display, ID3D11Texture2D* sourc
 			// held so the pointer cannot be reused by a different texture while the view is cached
 			source->AddRef();
 			display.desktopTexture = source;
-			_d3dContext->PSSetShaderResources(0, 1, &display.d3dDesktopView);
 		}
 
+		// bound again every frame: the binding does not survive between frames (measured: black frames otherwise)
+		_d3dContext->PSSetShaderResources(0, 1, &display.d3dDesktopView);
 		_d3dContext->Draw(4, 0);
 		_d3dContext->CopyResource(target, display.d3dConvertTexture);
 	}
