@@ -58,6 +58,12 @@
 #define CHECK(hr) SUCCEEDED(hr)
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
+namespace
+{
+	constexpr int FIRST_RETRY_DELAY_MS = 1000;
+	constexpr int MAX_RETRY_DELAY_MS = 10000;
+}
+
 DxGrabber::DxGrabber(const QString& device, const QString& configurationPath)
 	: Grabber(configurationPath, "DX11_SYSTEM:" + device.left(14))
 	, _configurationPath(configurationPath)
@@ -66,6 +72,7 @@ DxGrabber::DxGrabber(const QString& device, const QString& configurationPath)
 	, _multiMonitor(false)
 
 	, _dxRestartNow(false)
+	, _retryDelayMs(FIRST_RETRY_DELAY_MS)
 	, _d3dDevice(nullptr)
 	, _d3dContext(nullptr)
 {
@@ -136,9 +143,22 @@ void DxGrabber::uninit()
 	if (_dxRestartNow)
 	{
 		_dxRestartNow = false;
-		_retryTimer->setInterval(1000);
+		_retryTimer->setInterval(FIRST_RETRY_DELAY_MS);
 		_retryTimer->start();
 	}
+}
+
+// Keeps retrying a failed start (for example while the display driver is being reset or reinstalled),
+// waiting twice as long each time up to MAX_RETRY_DELAY_MS, instead of leaving the grabber stopped for good.
+void DxGrabber::scheduleRetry()
+{
+	if (_retryTimer->isActive())
+		return;
+
+	_retryTimer->setInterval(_retryDelayMs);
+	_retryTimer->start();
+	Warning(_log, "The DX grabber could not start. Retry in {:.1f} sec...", _retryDelayMs / 1000.0);
+	_retryDelayMs = std::min(_retryDelayMs * 2, MAX_RETRY_DELAY_MS);
 }
 
 void DxGrabber::newWorkerFrameHandler(unsigned int /*workerIndex*/, Image<ColorRgb> /*image*/, quint64 /*sourceCount*/, qint64 /*_frameBegin*/)
@@ -193,6 +213,7 @@ bool DxGrabber::init()
 		if (foundDevice.isNull() || foundDevice.isEmpty() || !_deviceProperties.contains(foundDevice))
 		{
 			Error(_log, "Could not find any capture device");
+			scheduleRetry();
 			return false;
 		}
 
@@ -205,7 +226,10 @@ bool DxGrabber::init()
 		{
 			connect(this, &Grabber::SignalNewCapturedFrame, this, &DxGrabber::cacheHandler, Qt::UniqueConnection);
 			_initialized = true;
+			_retryDelayMs = FIRST_RETRY_DELAY_MS;
 		}
+		else
+			scheduleRetry();
 	}
 
 	return _initialized;
@@ -474,7 +498,11 @@ bool DxGrabber::initDirectX(QString selectedDeviceName)
 							sourceTextureDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 							sourceTextureDesc.MiscFlags = 0;
 							sourceTextureDesc.BindFlags = 0;
-							if (CHECK(_d3dDevice->CreateTexture2D(&sourceTextureDesc, NULL, &display->d3dSourceTexture)))
+							bool stagingCreated = true;
+							for (auto& texture : display->d3dSourceTexture)
+								stagingCreated = stagingCreated && CHECK(_d3dDevice->CreateTexture2D(&sourceTextureDesc, NULL, &texture));
+
+							if (stagingCreated)
 							{
 								_actualVideoFormat = PixelFormat::XRGB;
 								display->actualWidth = _actualWidth = sourceTextureDesc.Width;
@@ -716,54 +744,110 @@ bool DxGrabber::initShaders(DisplayHandle& display)
 	return false;
 }
 
-HRESULT DxGrabber::deepScaledCopy(DisplayHandle& display, ID3D11Texture2D* source)
+HRESULT DxGrabber::deepScaledCopy(DisplayHandle& display, ID3D11Texture2D* source, ID3D11Texture2D* target)
 {
-	HRESULT status = S_OK;	
-	
+	HRESULT status = S_OK;
+
 	if (display.actualDivide >= 0)
-	{		
+	{
 		_d3dContext->CopySubresourceRegion(display.d3dConvertTexture, 0, 0, 0, 0, source, 0, NULL);
 		_d3dContext->GenerateMips(display.d3dConvertTextureView);
-		_d3dContext->CopySubresourceRegion(display.d3dSourceTexture, 0, 0, 0, 0, display.d3dConvertTexture, display.actualDivide, NULL);
+		_d3dContext->CopySubresourceRegion(target, 0, 0, 0, 0, display.d3dConvertTexture, display.actualDivide, NULL);
 	}
 	else
 	{
-		D3D11_TEXTURE2D_DESC sourceDesc;
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-
-		CLEAR(srvDesc);
-		CLEAR(sourceDesc);
-
-		source->GetDesc(&sourceDesc);
-
-		if (sourceDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && sourceDesc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
-			return E_INVALIDARG;
-
-		srvDesc.Format = sourceDesc.Format;
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Texture2D.MostDetailedMip = 0;
-		srvDesc.Texture2D.MipLevels = 1;
-
-		ID3D11ShaderResourceView* rv = nullptr;
-		status = _d3dDevice->CreateShaderResourceView(source, &srvDesc, &rv);
-
-		if (!CHECK(status))
+		// The duplication usually hands out the same texture every frame: make its view once, not 60 times a second
+		if (source != display.desktopTexture)
 		{
-			if (display.warningCounter > 0)
+			D3D11_TEXTURE2D_DESC sourceDesc;
+			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+
+			CLEAR(srvDesc);
+			CLEAR(sourceDesc);
+
+			source->GetDesc(&sourceDesc);
+
+			if (sourceDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && sourceDesc.Format != DXGI_FORMAT_R10G10B10A2_UNORM)
+				return E_INVALIDARG;
+
+			srvDesc.Format = sourceDesc.Format;
+			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Texture2D.MostDetailedMip = 0;
+			srvDesc.Texture2D.MipLevels = 1;
+
+			SafeRelease(&display.d3dDesktopView);
+			SafeRelease(&display.desktopTexture);
+
+			status = _d3dDevice->CreateShaderResourceView(source, &srvDesc, &display.d3dDesktopView);
+
+			if (!CHECK(status))
 			{
-				Error(_log, "CreateShaderResourceView failed ({:d}). Reason: {:d}", display.warningCounter--, status);
+				if (display.warningCounter > 0)
+				{
+					Error(_log, "CreateShaderResourceView failed ({:d}). Reason: {:x}", display.warningCounter--, static_cast<uint32_t>(status));
+				}
+				return status;
 			}
-			return status;
+
+			// held so the pointer cannot be reused by a different texture while the view is cached
+			source->AddRef();
+			display.desktopTexture = source;
+			_d3dContext->PSSetShaderResources(0, 1, &display.d3dDesktopView);
 		}
-		else
-			_d3dContext->PSSetShaderResources(0, 1, &rv);
 
 		_d3dContext->Draw(4, 0);
-		_d3dContext->CopyResource(display.d3dSourceTexture, display.d3dConvertTexture);
-		SafeRelease(&rv);
+		_d3dContext->CopyResource(target, display.d3dConvertTexture);
 	}
 
 	return status;
+}
+
+HRESULT DxGrabber::copyToStaging(DisplayHandle& display, IDXGIResource* resourceDesktop, int target)
+{
+	ID3D11Texture2D* texDesktop = nullptr;
+
+	HRESULT status = resourceDesktop->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texDesktop);
+
+	if (!CHECK(status) || texDesktop == nullptr)
+		return CHECK(status) ? E_POINTER : status;
+
+	if (_hardware)
+		status = deepScaledCopy(display, texDesktop, display.d3dSourceTexture[target]);
+	else
+		_d3dContext->CopyResource(display.d3dSourceTexture[target], texDesktop);
+
+	SafeRelease(&texDesktop);
+
+	// submit the copy now, so it is finished by the time readStaging() looks at it
+	if (CHECK(status))
+		_d3dContext->Flush();
+
+	return status;
+}
+
+// Returns DXGI_ERROR_WAS_STILL_DRAWING when wait is false and the GPU has not finished the copy yet (the frame is skipped).
+HRESULT DxGrabber::readStaging(DisplayHandle& display, int index, bool wait)
+{
+	D3D11_MAPPED_SUBRESOURCE internalMap{};
+
+	HRESULT status = _d3dContext->Map(display.d3dSourceTexture[index], 0, D3D11_MAP_READ, (wait) ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &internalMap);
+
+	if (!CHECK(status))
+		return status;
+
+	bool useLut = !(_hardware && display.wideGamut);
+	if (_hdrToneMappingEnabled && !_lutBufferInit && useLut)
+	{
+		loadLutFile(PixelFormat::RGB24, true);
+		pleaseWaitForLut(false);
+	}
+	else
+	{
+		processSystemFrameBGRA((uint8_t*)internalMap.pData, (int)internalMap.RowPitch, _hdrToneMappingEnabled && useLut);
+	}
+	_d3dContext->Unmap(display.d3dSourceTexture[index], 0);
+
+	return S_OK;
 }
 
 void DxGrabber::grabFrame()
@@ -867,59 +951,67 @@ void DxGrabber::captureFrame(DisplayHandle& display)
 	DXGI_OUTDUPL_FRAME_INFO infoFrame{};
 	IDXGIResource* resourceDesktop = nullptr;
 
+	// No new desktop image: show the frame still waiting in a staging texture, else repeat the last one
+	auto showPendingOrCache = [&]()
+	{
+		if (display.stagingPending >= 0)
+		{
+			HRESULT readStatus = readStaging(display, display.stagingPending, true);
+			display.stagingPending = -1;
+
+			if (!CHECK(readStatus))
+			{
+				Error(_log, "Cannot map the staging texture. Reason: {:x}. Restarting...", static_cast<uint32_t>(readStatus));
+				_dxRestartNow = true;
+			}
+		}
+		else if (_cacheImage.width() > 1)
+		{
+			emit SignalNewCapturedFrame(_cacheImage);
+		}
+	};
+
 	auto status = display.d3dDuplicate->AcquireNextFrame(0, &infoFrame, &resourceDesktop);
 
 	if (CHECK(status))
 	{
-		D3D11_MAPPED_SUBRESOURCE internalMap{};
-		ID3D11Texture2D* texDesktop = nullptr;
+		// LastPresentTime is 0 when only the mouse pointer moved: the desktop image is unchanged
+		bool newImage = infoFrame.LastPresentTime.QuadPart != 0 || _cacheImage.width() <= 1;
+		int target = display.stagingWrite;
 
-		CLEAR(internalMap);
+		if (newImage)
+			status = copyToStaging(display, resourceDesktop, target);
 
-		status = resourceDesktop->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texDesktop);
+		// give the desktop image back as soon as the copy is queued
+		SafeRelease(&resourceDesktop);
+		display.d3dDuplicate->ReleaseFrame();
 
-		if (CHECK(status) && texDesktop != nullptr)
+		if (!CHECK(status))
 		{
-			if (_hardware)
+			Error(_log, "Cannot copy the desktop texture. Reason: {:x}. Restarting...", static_cast<uint32_t>(status));
+			_dxRestartNow = true;
+		}
+		else if (newImage)
+		{
+			// The previous frame has had a whole capture interval to finish on the GPU, so reading it does not stall.
+			// If it is somehow still not ready it is skipped: the one just queued replaces it.
+			if (display.stagingPending >= 0)
 			{
-				status = deepScaledCopy(display, texDesktop);
+				status = readStaging(display, display.stagingPending, false);
 
-				if (!CHECK(status))
+				if (!CHECK(status) && status != DXGI_ERROR_WAS_STILL_DRAWING)
 				{
-					Error(_log, "DeepScaledCopy failed. Reason: {:d}", status);
+					Error(_log, "Cannot map the staging texture. Reason: {:x}. Restarting...", static_cast<uint32_t>(status));
+					_dxRestartNow = true;
 				}
 			}
-			else
-			{
-				_d3dContext->CopyResource(display.d3dSourceTexture, texDesktop);
-			}
 
-			if (CHECK(status) && CHECK(_d3dContext->Map(display.d3dSourceTexture, 0, D3D11_MAP_READ, 0, &internalMap)))
-			{
-				bool useLut = !(_hardware && display.wideGamut);
-				if (_hdrToneMappingEnabled && !_lutBufferInit && useLut)
-				{
-					loadLutFile(PixelFormat::RGB24, true);
-					pleaseWaitForLut(false);
-				}
-				else
-				{
-					processSystemFrameBGRA((uint8_t*)internalMap.pData, (int)internalMap.RowPitch, _hdrToneMappingEnabled && useLut);
-				}
-				_d3dContext->Unmap(display.d3dSourceTexture, 0);
-			}
-			else
-			{
-				Error(_log, "Cannot copy or map texture. Reason: {:d}. Restarting...", status);
-				_dxRestartNow = true;
-			}
-
-			SafeRelease(&texDesktop);
+			display.stagingPending = target;
+			display.stagingWrite = (target + 1) % DisplayHandle::STAGING_COUNT;
 		}
 		else
 		{
-			Error(_log, "ResourceDesktop->QueryInterface failed. Reason: {:d}", status);
-			_dxRestartNow = true;
+			showPendingOrCache();
 		}
 	}
 	else if (status == DXGI_ERROR_WAIT_TIMEOUT)
@@ -930,10 +1022,7 @@ void DxGrabber::captureFrame(DisplayHandle& display)
 			display.warningCounter--;
 		}
 
-		if (_cacheImage.width() > 1)
-		{
-			emit SignalNewCapturedFrame(_cacheImage);
-		}
+		showPendingOrCache();
 	}
 	else if (status == DXGI_ERROR_ACCESS_LOST)
 	{
@@ -947,12 +1036,13 @@ void DxGrabber::captureFrame(DisplayHandle& display)
 	}
 	else
 	{
-		Error(_log, "AcquireNextFrame failed. Reason: {:d}", status);
+		// e.g. DXGI_ERROR_DEVICE_REMOVED after a driver reset: the duplication will never work again, start over
+		Error(_log, "AcquireNextFrame failed. Reason: {:x}. Restarting...", static_cast<uint32_t>(status));
+		_dxRestartNow = true;
 	}
 
+	// a frame that was not acquired is not released
 	SafeRelease(&resourceDesktop);
-
-	display.d3dDuplicate->ReleaseFrame();
 
 	if (_dxRestartNow)
 	{
@@ -971,29 +1061,33 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 	if (CHECK(status))
 	{
 		D3D11_MAPPED_SUBRESOURCE internalMap{};
-		ID3D11Texture2D* texDesktop = nullptr;
 
 		CLEAR(internalMap);
 
-		status = resourceDesktop->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texDesktop);
+		// LastPresentTime is 0 when only the mouse pointer moved: this display's part of the cached image still holds
+		bool newImage = infoFrame.LastPresentTime.QuadPart != 0 || _cacheImage.width() <= 1;
 
-		if (CHECK(status) && texDesktop != nullptr)
+		if (newImage)
+			status = copyToStaging(display, resourceDesktop, 0);
+
+		SafeRelease(&resourceDesktop);
+		display.d3dDuplicate->ReleaseFrame();
+
+		if (!newImage)
 		{
-			if (_hardware)
-			{
-				status = deepScaledCopy(display, texDesktop);
+			result = 0;
+		}
+		else if (!CHECK(status))
+		{
+			Error(_log, "Cannot copy the desktop texture. Reason: {:x}. Restarting...", static_cast<uint32_t>(status));
+			_dxRestartNow = true;
+		}
+		else
+		{
+			// several displays are combined into one image, so this path reads its copy back at once
+			status = _d3dContext->Map(display.d3dSourceTexture[0], 0, D3D11_MAP_READ, 0, &internalMap);
 
-				if (!CHECK(status))
-				{
-					Error(_log, "DeepScaledCopy failed. Reason: {:d}", status);
-				}
-			}
-			else
-			{
-				_d3dContext->CopyResource(display.d3dSourceTexture, texDesktop);
-			}
-
-			if (CHECK(status) && CHECK(_d3dContext->Map(display.d3dSourceTexture, 0, D3D11_MAP_READ, 0, &internalMap)))
+			if (CHECK(status))
 			{
 				int lineSize = (int)internalMap.RowPitch;
 				bool useLut = !(_hardware && display.wideGamut);
@@ -1013,20 +1107,13 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 				}
 
 				result = 1;
-				_d3dContext->Unmap(display.d3dSourceTexture, 0);
+				_d3dContext->Unmap(display.d3dSourceTexture[0], 0);
 			}
 			else
 			{
-				Error(_log, "Cannot copy or map texture. Reason: {:d}. Restarting...", status);
+				Error(_log, "Cannot map the staging texture. Reason: {:x}. Restarting...", static_cast<uint32_t>(status));
 				_dxRestartNow = true;
 			}
-
-			SafeRelease(&texDesktop);
-		}
-		else if (display.warningCounter > 0)
-		{
-			Error(_log, "ResourceDesktop->QueryInterface failed. Reason: {:d}", status);
-			display.warningCounter--;
 		}
 	}
 	else if (status == DXGI_ERROR_WAIT_TIMEOUT)
@@ -1052,15 +1139,15 @@ int DxGrabber::captureFrame(DisplayHandle& display, Image<ColorRgb>& image)
 		Error(_log, "DirectX invalid call. Stopping.");
 		_dxRestartNow = true;
 	}
-	else if (display.warningCounter > 0)
+	else
 	{
-		Error(_log, "AcquireNextFrame failed. Reason: {:d}", status);
-		display.warningCounter--;
+		// e.g. DXGI_ERROR_DEVICE_REMOVED after a driver reset: the duplication will never work again, start over
+		Error(_log, "AcquireNextFrame failed. Reason: {:x}. Restarting...", static_cast<uint32_t>(status));
+		_dxRestartNow = true;
 	}
 
+	// a frame that was not acquired is not released
 	SafeRelease(&resourceDesktop);
-
-	display.d3dDuplicate->ReleaseFrame();
 
 	if (_dxRestartNow)
 	{

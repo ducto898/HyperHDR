@@ -40,6 +40,8 @@ template <class T> void SafeRelease(T** ppT)
 struct DisplayHandle
 {
 	static constexpr int WARNING_COUNT = 6;
+	// Frames are read back one capture later, so the CPU never waits for the GPU to finish the copy
+	static constexpr int STAGING_COUNT = 2;
 
 	QString name;
 	int warningCounter = DisplayHandle::WARNING_COUNT;
@@ -55,7 +57,11 @@ struct DisplayHandle
 	ID3D11SamplerState* d3dSampler = nullptr;
 	ID3D11InputLayout* d3dVertexLayout = nullptr;
 	IDXGIOutputDuplication* d3dDuplicate = nullptr;
-	ID3D11Texture2D* d3dSourceTexture = nullptr;
+	ID3D11Texture2D* d3dSourceTexture[STAGING_COUNT] = {};
+	int stagingWrite = 0;		// staging texture the next frame is copied to
+	int stagingPending = -1;	// staging texture holding a frame not read yet, or -1
+	ID3D11Texture2D* desktopTexture = nullptr;			// the duplication's texture d3dDesktopView was made for (one reference held)
+	ID3D11ShaderResourceView* d3dDesktopView = nullptr;
 	DXGI_OUTDUPL_DESC surfaceProperties{};
 
 	DisplayHandle() = default;
@@ -63,7 +69,10 @@ struct DisplayHandle
 	~DisplayHandle()
 	{
 		SafeRelease(&d3dRenderTargetView);
-		SafeRelease(&d3dSourceTexture);
+		for (auto& texture : d3dSourceTexture)
+			SafeRelease(&texture);
+		SafeRelease(&d3dDesktopView);
+		SafeRelease(&desktopTexture);
 		SafeRelease(&d3dConvertTextureView);
 		SafeRelease(&d3dConvertTexture);
 		SafeRelease(&d3dVertexShader);
@@ -135,7 +144,10 @@ private:
 	bool initDirectX(QString selectedDeviceName);
 
 	bool initShaders(DisplayHandle& display);
-	HRESULT deepScaledCopy(DisplayHandle& display, ID3D11Texture2D* source);
+	HRESULT deepScaledCopy(DisplayHandle& display, ID3D11Texture2D* source, ID3D11Texture2D* target);
+	HRESULT copyToStaging(DisplayHandle& display, IDXGIResource* resourceDesktop, int target);
+	HRESULT readStaging(DisplayHandle& display, int index, bool wait);
+	void scheduleRetry();
 
 	QString					_configurationPath;
 	QTimer*					_timer;
@@ -143,6 +155,7 @@ private:
 	bool					_multiMonitor;
 
 	bool					_dxRestartNow;
+	int						_retryDelayMs;
 	std::list<std::unique_ptr<DisplayHandle>> _handles;
 	ID3D11Device*			_d3dDevice;
 	ID3D11DeviceContext*	_d3dContext;
